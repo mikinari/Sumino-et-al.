@@ -1,0 +1,711 @@
+---
+title: "Preoperative prediction of lymph node metastasis in endometrial cancer"
+subtitle: "Multiple imputation, LASSO model development, and bootstrap internal validation"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+# Analysis code
+
+This script describes model development and validation in the overall cohort (n = 267) and the primary cohort without radiological lymph node enlargement (n = 246). It expects a preselected dataset of eligible patients using the standard variable names below. Individual patient data are not shared. Set `PRIMARY_COHORT` to `TRUE` or `FALSE` to analyze either cohort.
+
+The workflow covers multiple imputation, LASSO regression, bootstrap internal validation, and figures. The code is shared for methodological transparency; numerical results cannot be reproduced without the restricted dataset.
+
+# Analysis settings
+
+```{r settings}
+# Input: one row per eligible patient in the overall cohort (n = 267).
+# No patient-level data or source-system column names are distributed.
+DATA_FILE <- file.path("data", "analysis_dataset.csv")
+PRIMARY_COHORT <- TRUE  # TRUE: 246 patients; FALSE: all 267 patients
+
+# Required columns and coding:
+# lnm: pathological LNM (0/1)
+# age (years), bmi (kg/m^2), tumor_volume_index (cm^3), ca125, ca19_9,
+# albumin_globulin_ratio, crp: continuous
+# deep_myometrial_invasion, cervical_stromal_invasion,
+# extrauterine_extension, radiologic_ln_enlargement: imaging (0/1)
+# preop_histology: endometrioid carcinoma grades 1–3 (EMG1–EMG3),
+# and other high-grade histologies (Other)
+# molecular_subtype: 1=p53-abnormal, 2=NSMP, 3=MSI-H, 4=POLE-mutated
+REQUIRED_COLUMNS <- c(
+  "lnm", "age", "bmi", "deep_myometrial_invasion", "tumor_volume_index",
+  "ca125", "ca19_9", "albumin_globulin_ratio", "crp",
+  "molecular_subtype", "preop_histology", "cervical_stromal_invasion",
+  "extrauterine_extension", "radiologic_ln_enlargement"
+)
+
+M_IMP <- 20
+MAXIT <- 10
+NFOLDS_CV <- 10
+SELECT_FREQ_THRESHOLD <- 0.40
+B <- 200
+M_BOOT <- M_IMP
+MAXIT_BOOT <- MAXIT
+SEED <- 2026
+OUTPUT_DIR <- if (PRIMARY_COHORT) "output_primary" else "output_overall"
+FIG_DPI <- 600
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Packages
+
+```{r packages}
+pkgs <- c("dplyr", "mice", "glmnet", "rms", "knitr", "kableExtra",
+          "pROC", "ggplot2", "patchwork", "ragg")
+
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Please install the following packages: ", paste(missing_pkgs, collapse = ", "))
+}
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+# Data and cohort
+
+```{r load-data}
+if (!file.exists(DATA_FILE)) {
+  stop("Standardized analysis file is unavailable: ", DATA_FILE,
+       ". See the required variable definitions in the Settings section.")
+}
+raw <- utils::read.csv(DATA_FILE, na.strings = c("", "NA"),
+                       stringsAsFactors = FALSE, check.names = FALSE)
+absent <- setdiff(REQUIRED_COLUMNS, names(raw))
+if (length(absent) > 0) {
+  stop("Required standardized columns are missing: ",
+       paste(absent, collapse = ", "))
+}
+dat <- raw[, REQUIRED_COLUMNS, drop = FALSE]
+```
+
+```{r preprocess}
+outcome_var <- "lnm"
+numeric_vars <- c("age", "bmi", "tumor_volume_index", "ca125", "ca19_9",
+                  "albumin_globulin_ratio", "crp")
+for (v in numeric_vars) dat[[v]] <- suppressWarnings(as.numeric(dat[[v]]))
+dat$lnm <- suppressWarnings(as.numeric(as.character(dat$lnm)))
+
+binary_vars <- c("deep_myometrial_invasion", "cervical_stromal_invasion",
+                 "extrauterine_extension", "radiologic_ln_enlargement")
+for (v in binary_vars) {
+  values <- as.character(dat[[v]])
+  if (any(!is.na(values) & !(values %in% c("0", "1")))) stop("Invalid binary coding: ", v)
+  dat[[v]] <- factor(values, levels = c("0", "1"))
+}
+
+if (anyNA(dat$lnm) || any(!(dat$lnm %in% c(0, 1))))
+  stop("The eligible cohort must have observed binary pathological LNM outcomes.")
+if (anyNA(dat$radiologic_ln_enlargement))
+  stop("Radiological lymph node enlargement must be known for cohort assignment.")
+
+hist <- trimws(as.character(dat$preop_histology))
+if (anyNA(hist) || any(!(hist %in% c("EMG1", "EMG2", "EMG3", "Other"))))
+  stop("Invalid or missing preoperative histology category.")
+dat$histology_group <- factor(hist, levels = c("EMG1", "EMG2", "EMG3", "Other"))
+subtype <- as.character(dat$molecular_subtype)
+if (anyNA(subtype) || any(!(subtype %in% c("1", "2", "3", "4"))))
+  stop("Invalid or missing molecular subtype category.")
+dat$molecular_subtype <- factor(subtype, levels = c("1", "2", "3", "4"))
+
+if (PRIMARY_COHORT) {
+  dat <- dat[dat$radiologic_ln_enlargement == "0", , drop = FALSE]
+} else {
+  stopifnot(all(!is.na(dat$radiologic_ln_enlargement)))
+}
+INCLUDE_RADIOLOGIC_LN_AS_VAR <- !PRIMARY_COHORT
+if (PRIMARY_COHORT) dat$radiologic_ln_enlargement <- NULL
+dat$preop_histology <- NULL
+
+cat(sprintf("Cohort: %d patients (%d LNM-positive).\n", nrow(dat), sum(dat$lnm == 1)))
+```
+
+# Multiple imputation
+
+```{r mice-impute}
+base_vars <- c("age", "bmi", "deep_myometrial_invasion", "tumor_volume_index",
+               "ca125", "ca19_9", "albumin_globulin_ratio", "crp",
+               "histology_group", "molecular_subtype",
+               "cervical_stromal_invasion", "extrauterine_extension")
+if (INCLUDE_RADIOLOGIC_LN_AS_VAR) base_vars <- c(base_vars, "radiologic_ln_enlargement")
+
+constant_vars <- base_vars[sapply(base_vars, function(v) length(unique(na.omit(dat[[v]]))) <= 1)]
+if (length(constant_vars) > 0) {
+  warning("Constant predictors: ", paste(constant_vars, collapse = ", "))
+}
+
+df_impute <- dat %>% dplyr::select(all_of(union(base_vars, outcome_var)))
+
+meth <- mice::make.method(df_impute)
+meth[outcome_var] <- ""   # outcome is not imputed
+pred <- mice::make.predictorMatrix(df_impute)
+
+imp <- mice::mice(df_impute, m = M_IMP, method = meth, predictorMatrix = pred,
+                  maxit = MAXIT, seed = SEED, printFlag = FALSE)
+
+write.csv(data.frame(predictor = names(df_impute),
+                     missing = colSums(is.na(df_impute))),
+          file.path(OUTPUT_DIR, "missingness.csv"), row.names = FALSE)
+```
+
+```{r derive-vars}
+# log2(volume index + 1) is derived after imputation in every imputed dataset.
+add_log_volume <- function(d) {
+  d %>% dplyr::mutate(tumor_volume_index_log2 = ifelse(
+    !is.na(tumor_volume_index) & tumor_volume_index >= 0,
+    log2(tumor_volume_index + 1), NA_real_))
+}
+
+imp2 <- mice::as.mids(add_log_volume(mice::complete(imp, action = "long", include = TRUE)))
+```
+
+# Model development (LASSO)
+
+```{r lasso}
+lasso_vars <- c("age", "bmi", "deep_myometrial_invasion", "tumor_volume_index_log2",
+                "ca125", "ca19_9", "albumin_globulin_ratio", "crp",
+                "histology_group", "molecular_subtype",
+                "cervical_stromal_invasion", "extrauterine_extension")
+if (INCLUDE_RADIOLOGIC_LN_AS_VAR) lasso_vars <- c(lasso_vars, "radiologic_ln_enlargement")
+
+d1 <- mice::complete(imp2, action = 1)
+n_levels <- sapply(lasso_vars, function(v) length(unique(na.omit(d1[[v]]))))
+lasso_vars_use <- lasso_vars[n_levels > 1]
+
+# Design matrix (rows with any missing candidate predictor are dropped)
+build_xy <- function(d) {
+  d_sub <- d %>% dplyr::select(all_of(c(outcome_var, lasso_vars_use)))
+  ok    <- stats::complete.cases(d_sub)
+  d_sub <- d_sub[ok, , drop = FALSE]
+  y <- as.numeric(as.character(d_sub[[outcome_var]]))
+  X <- model.matrix(as.formula(paste("~", paste(lasso_vars_use, collapse = " + "))),
+                    data = d_sub)[, -1, drop = FALSE]
+  list(X = X, y = y, rows_kept = which(ok))
+}
+
+# Predicted probability from a coefficient vector (same length as nrow(d))
+predict_penalized <- function(d, coef_vec) {
+  xy   <- build_xy(d)
+  beta <- coef_vec[colnames(xy$X)]
+  beta[is.na(beta)] <- 0
+  lp   <- coef_vec["(Intercept)"] + as.numeric(xy$X %*% beta)
+  p    <- rep(NA_real_, nrow(d))
+  p[xy$rows_kept] <- 1 / (1 + exp(-lp))
+  p
+}
+
+lasso_coefs_list <- vector("list", M_IMP)
+lambda_min_list  <- numeric(M_IMP)
+
+for (i in seq_len(M_IMP)) {
+  xy <- build_xy(mice::complete(imp2, action = i))
+  set.seed(SEED + i)
+  cvfit <- glmnet::cv.glmnet(xy$X, xy$y, family = "binomial", alpha = 1, nfolds = NFOLDS_CV)
+  lasso_coefs_list[[i]] <- as.matrix(coef(cvfit, s = "lambda.min"))[, 1]
+  lambda_min_list[i]    <- cvfit$lambda.min
+}
+
+all_terms <- Reduce(union, lapply(lasso_coefs_list, names))
+coef_mat  <- do.call(cbind, lapply(lasso_coefs_list, function(v) v[all_terms]))
+coef_mat  <- as.matrix(coef_mat)
+rownames(coef_mat) <- all_terms
+
+final_coef     <- rowMeans(coef_mat, na.rm = TRUE)
+selection_freq <- rowMeans(coef_mat != 0, na.rm = TRUE)
+```
+
+```{r select-stable-vars}
+# Map each model term (e.g. "histology_groupEMG2") to its source variable
+term_to_base <- function(term, vars) {
+  vv  <- vars[order(-nchar(vars))]
+  hit <- vv[startsWith(term, vv)]
+  if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+# Variable-level selection frequency: any dummy of the variable non-zero
+var_level_freq <- sapply(lasso_vars_use, function(v) {
+  terms_v <- all_terms[sapply(all_terms, term_to_base, vars = lasso_vars_use) == v]
+  terms_v <- intersect(terms_v, rownames(coef_mat))
+  if (length(terms_v) == 0) return(0)
+  mean(apply(coef_mat[terms_v, , drop = FALSE] != 0, 2, any, na.rm = TRUE), na.rm = TRUE)
+})
+
+selected_base_vars <- names(var_level_freq)[var_level_freq >= SELECT_FREQ_THRESHOLD]
+write.csv(data.frame(predictor = names(var_level_freq),
+                     selected_datasets = as.integer(round(M_IMP * var_level_freq)),
+                     selection_frequency = as.numeric(var_level_freq),
+                     retained = names(var_level_freq) %in% selected_base_vars),
+          file.path(OUTPUT_DIR, "selection_frequency.csv"), row.names = FALSE)
+
+kept_terms <- c("(Intercept)",
+                all_terms[sapply(all_terms, term_to_base, vars = lasso_vars_use) %in%
+                            selected_base_vars])
+kept_terms <- intersect(kept_terms, names(final_coef))
+
+final_coef_simplified <- final_coef
+final_coef_simplified[setdiff(names(final_coef), kept_terms)] <- 0
+
+# Tables
+coef_table <- data.frame(
+  term                      = names(final_coef),
+  mean_penalized_coef       = final_coef,
+  term_selection_frequency  = selection_freq,
+  coef_final_model          = final_coef_simplified,
+  row.names = NULL
+)
+write.csv(coef_table, file.path(OUTPUT_DIR, "model_coefficients.csv"), row.names = FALSE)
+
+cat(sprintf("Retained predictors: %s\n", paste(selected_base_vars, collapse = ", ")))
+```
+
+## Model object for the nomogram
+
+`rms::nomogram()` cannot take a glmnet object, so an `lrm` object with the same terms is fitted
+for its structure only and its coefficients are replaced by the pooled penalized coefficients.
+Predictions are checked for numerical agreement.
+
+```{r nomogram-model}
+nomo_vars    <- if (length(selected_base_vars) > 0) selected_base_vars else lasso_vars_use
+dat_for_nomo <- mice::complete(imp2, action = 1)
+
+dd <- rms::datadist(dat_for_nomo)
+old_datadist <- getOption("datadist")
+options(datadist = "dd")
+
+fit_lrm0 <- rms::lrm(as.formula(paste(outcome_var, "~", paste(nomo_vars, collapse = " + "))),
+                     data = dat_for_nomo, x = TRUE, y = TRUE)
+
+normalize_name <- function(x) gsub("[=()]", "", x)
+matched_idx <- match(normalize_name(names(coef(fit_lrm0))), normalize_name(names(final_coef)))
+if (any(is.na(matched_idx))) stop("lrm terms could not be matched to penalized coefficients")
+
+fit_nomo <- fit_lrm0
+fit_nomo$coefficients <- setNames(final_coef_simplified[matched_idx], names(coef(fit_lrm0)))
+
+dat_verify <- dat_for_nomo[stats::complete.cases(dat_for_nomo[, lasso_vars_use, drop = FALSE]), ]
+max_diff <- max(abs(predict_penalized(dat_verify, final_coef_simplified) -
+                    as.numeric(predict(fit_nomo, newdata = dat_verify, type = "fitted"))))
+cat(sprintf("Maximum difference, penalized vs nomogram model predictions: %.2e\n", max_diff))
+stopifnot(max_diff < 1e-8)
+
+options(datadist = old_datadist)
+```
+
+# Apparent performance
+
+```{r perf-helpers}
+safe_auc <- function(y, p) {
+  ok <- !is.na(p) & !is.na(y)
+  if (sum(ok) < 2 || length(unique(y[ok])) < 2) return(NA_real_)
+  tryCatch(as.numeric(pROC::auc(pROC::roc(y[ok], p[ok], quiet = TRUE))),
+           error = function(e) NA_real_)
+}
+
+# Calibration intercept (calibration-in-the-large) and slope
+safe_calibration <- function(y, p) {
+  ok <- !is.na(y) & !is.na(p)
+  y <- y[ok]; p <- p[ok]
+  if (length(y) < 5 || length(unique(y)) < 2) return(c(intercept = NA_real_, slope = NA_real_))
+  lp <- qlogis(pmin(pmax(p, 1e-6), 1 - 1e-6))
+  slope     <- tryCatch(unname(coef(glm(y ~ lp, family = binomial()))[2]),
+                        error = function(e) NA_real_)
+  intercept <- tryCatch(unname(coef(glm(y ~ offset(lp), family = binomial()))[1]),
+                        error = function(e) NA_real_)
+  c(intercept = intercept, slope = slope)
+}
+
+```
+
+```{r apparent-performance}
+# Pooled predicted probability: mean across imputed datasets
+pred_mat <- sapply(seq_len(M_IMP), function(i) {
+  predict_penalized(mice::complete(imp2, action = i), final_coef_simplified)
+})
+pred_prob_pooled <- rowMeans(pred_mat, na.rm = TRUE)
+actual <- as.numeric(as.character(mice::complete(imp2, action = 1)[[outcome_var]]))
+stopifnot(!anyNA(pred_prob_pooled))
+
+roc_obj <- pROC::roc(actual, pred_prob_pooled, quiet = TRUE, ci = TRUE)
+auc_apparent <- as.numeric(pROC::auc(roc_obj))
+auc_ci_delong <- as.numeric(pROC::ci.auc(roc_obj))
+
+# Youden-optimal threshold (first one if tied)
+best_coords <- pROC::coords(roc_obj, "best", best.method = "youden",
+                            ret = c("threshold", "sensitivity", "specificity", "ppv", "npv"))
+best_coords <- lapply(as.list(as.data.frame(best_coords)), function(v) as.numeric(v[1]))
+
+# Calibration
+cal_apparent           <- safe_calibration(actual, pred_prob_pooled)
+cal_intercept_apparent <- cal_apparent["intercept"]
+cal_slope_apparent     <- cal_apparent["slope"]
+
+# Full model (all candidate variables), for comparison only
+pred_prob_pooled_full <- rowMeans(sapply(seq_len(M_IMP), function(i) {
+  predict_penalized(mice::complete(imp2, action = i), final_coef)
+}), na.rm = TRUE)
+auc_apparent_full <- safe_auc(actual, pred_prob_pooled_full)
+
+cat(sprintf("Apparent AUC %.3f (95%% CI %.3f-%.3f)\n",
+            auc_apparent, auc_ci_delong[1], auc_ci_delong[3]))
+```
+
+# Bootstrap internal validation
+
+```{r bootstrap-setup}
+# Full model-building pipeline applied to one bootstrap sample
+fit_lasso_pipeline_boot <- function(dat_raw, m_boot, maxit_boot, seed_i) {
+  meth_b <- mice::make.method(dat_raw); meth_b[outcome_var] <- ""
+  pred_b <- mice::make.predictorMatrix(dat_raw)
+  imp_b  <- mice::mice(dat_raw, m = m_boot, method = meth_b, predictorMatrix = pred_b,
+                       maxit = maxit_boot, seed = seed_i, printFlag = FALSE)
+  imp2_b <- mice::as.mids(add_log_volume(mice::complete(imp_b, action = "long", include = TRUE)))
+
+  coefs <- vector("list", m_boot)
+  for (i in seq_len(m_boot)) {
+    xy <- build_xy(mice::complete(imp2_b, action = i))
+    set.seed(seed_i * 1000 + i)
+    cvf <- tryCatch(glmnet::cv.glmnet(xy$X, xy$y, family = "binomial", alpha = 1, nfolds = NFOLDS_CV),
+                    error = function(e) NULL)
+    if (is.null(cvf)) next
+    coefs[[i]] <- as.matrix(coef(cvf, s = "lambda.min"))[, 1]
+  }
+  coefs <- coefs[!sapply(coefs, is.null)]
+  if (length(coefs) != m_boot) return(NULL) # retain only complete bootstrap pipelines
+
+  terms_b <- Reduce(union, lapply(coefs, names))
+  cm <- do.call(cbind, lapply(coefs, function(v) v[terms_b]))
+  cm <- as.matrix(cm)
+  rownames(cm) <- terms_b
+  coef_avg_b      <- rowMeans(cm, na.rm = TRUE)
+  coef_avg_b_full <- coef_avg_b
+
+  # Same variable-retention rule as the main analysis, applied within the bootstrap sample
+  base_b <- sapply(terms_b, term_to_base, vars = lasso_vars_use)
+  var_freq_b <- sapply(lasso_vars_use, function(v) {
+    terms_v <- terms_b[!is.na(base_b) & base_b == v]
+    if (length(terms_v) == 0) return(0)
+    mean(apply(cm[terms_v, , drop = FALSE] != 0, 2, any, na.rm = TRUE), na.rm = TRUE)
+  })
+  keep_vars_b  <- names(var_freq_b)[var_freq_b >= SELECT_FREQ_THRESHOLD]
+  keep_terms_b <- c("(Intercept)", terms_b[base_b %in% keep_vars_b])
+  coef_avg_b[setdiff(names(coef_avg_b), keep_terms_b)] <- 0
+
+  list(coef = coef_avg_b, coef_full = coef_avg_b_full, imp = imp2_b)
+}
+
+# LOWESS calibration curve evaluated on a fixed grid (no extrapolation)
+smooth_calibration_at <- function(y, p, xout, f = 2/3) {
+  ok <- is.finite(y) & is.finite(p)
+  y <- as.numeric(y[ok]); p <- as.numeric(p[ok])
+  if (length(y) < 20 || length(unique(y)) < 2 || length(unique(p)) < 5)
+    return(rep(NA_real_, length(xout)))
+  ord <- order(p)
+  sm <- tryCatch(stats::lowess(p[ord], y[ord], f = f, iter = 0), error = function(e) NULL)
+  if (is.null(sm) || length(unique(sm$x)) < 2) return(rep(NA_real_, length(xout)))
+  pmin(pmax(stats::approx(sm$x, sm$y, xout = xout, ties = mean, rule = 1)$y, 0), 1)
+}
+
+cal_pred <- pred_prob_pooled
+cal_xmax <- min(1, max(0.40, ceiling(as.numeric(quantile(cal_pred, 0.99)) / 0.05) * 0.05))
+cal_grid <- seq(0, cal_xmax, length.out = 81)
+cal_curve_apparent <- smooth_calibration_at(actual, cal_pred, cal_grid)
+```
+
+```{r bootstrap-run}
+optimism_vec           <- rep(NA_real_, B)
+optimism_vec_full      <- rep(NA_real_, B)
+auc_boot_apparent_vec  <- rep(NA_real_, B)
+slope_optimism_vec     <- rep(NA_real_, B)
+intercept_optimism_vec <- rep(NA_real_, B)
+cal_curve_optimism_mat <- matrix(NA_real_, nrow = B, ncol = length(cal_grid))
+
+pooled_pred <- function(imp_obj, m, coef_vec) {
+  rowMeans(sapply(seq_len(m), function(i) {
+    predict_penalized(mice::complete(imp_obj, action = i), coef_vec)
+  }), na.rm = TRUE)
+}
+
+t0 <- Sys.time()
+set.seed(SEED)
+
+for (b in seq_len(B)) {
+  idx_b    <- sample(seq_len(nrow(df_impute)), replace = TRUE)
+  boot_raw <- df_impute[idx_b, ]
+
+  fitb <- fit_lasso_pipeline_boot(boot_raw, m_boot = M_BOOT, maxit_boot = MAXIT_BOOT,
+                                  seed_i = 1000 + b)
+  if (is.null(fitb)) next
+
+  actual_boot <- as.numeric(as.character(boot_raw[[outcome_var]]))
+
+  # Final (retained-variable) model: bootstrap sample and original sample
+  pred_boot <- pooled_pred(fitb$imp, fitb$imp$m, fitb$coef)
+  pred_orig <- pooled_pred(imp2, M_IMP, fitb$coef)
+
+  auc_boot_apparent <- safe_auc(actual_boot, pred_boot)
+  optimism_vec[b]          <- auc_boot_apparent - safe_auc(actual, pred_orig)
+  auc_boot_apparent_vec[b] <- auc_boot_apparent
+
+  cal_boot <- safe_calibration(actual_boot, pred_boot)
+  cal_test <- safe_calibration(actual, pred_orig)
+  slope_optimism_vec[b]     <- cal_boot["slope"] - cal_test["slope"]
+  intercept_optimism_vec[b] <- cal_boot["intercept"] - cal_test["intercept"]
+
+  cal_curve_optimism_mat[b, ] <- smooth_calibration_at(actual_boot, pred_boot, cal_grid) -
+                                 smooth_calibration_at(actual, pred_orig, cal_grid)
+
+
+  # Full model (all candidate variables), for comparison only
+  optimism_vec_full[b] <- safe_auc(actual_boot, pooled_pred(fitb$imp, fitb$imp$m, fitb$coef_full)) -
+                          safe_auc(actual, pooled_pred(imp2, M_IMP, fitb$coef_full))
+
+  if (b %% 20 == 0) cat(sprintf("Bootstrap %d / %d\n", b, B))
+}
+
+cat(sprintf("Elapsed: %.1f min; valid resamples (AUC): %d / %d\n",
+            as.numeric(Sys.time() - t0, units = "mins"), sum(is.finite(optimism_vec)), B))
+```
+
+```{r optimism-correction}
+if (sum(is.finite(optimism_vec)) < 2) stop("Insufficient valid bootstrap resamples to calculate corrected AUC")
+mean_optimism <- mean(optimism_vec, na.rm = TRUE)
+auc_corrected <- auc_apparent - mean_optimism
+
+# Location-shifted bootstrap 95% CI (Noma et al., Stat Med 2021)
+auc_boot_ok      <- auc_boot_apparent_vec[is.finite(auc_boot_apparent_vec) & is.finite(optimism_vec)]
+auc_corrected_ci <- pmin(pmax(quantile(auc_boot_ok, c(0.025, 0.975), names = FALSE) -
+                                mean_optimism, 0), 1)
+
+auc_corrected_full <- auc_apparent_full - mean(optimism_vec_full, na.rm = TRUE)
+
+cal_intercept_corrected <- cal_intercept_apparent - mean(intercept_optimism_vec, na.rm = TRUE)
+cal_slope_corrected     <- cal_slope_apparent - mean(slope_optimism_vec, na.rm = TRUE)
+
+# Optimism-corrected calibration curve
+cal_curve_mean_optimism <- apply(cal_curve_optimism_mat, 2, function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+})
+cal_curve_corrected <- pmin(pmax(cal_curve_apparent - cal_curve_mean_optimism, 0), 1)
+cal_curve_corrected[colSums(is.finite(cal_curve_optimism_mat)) < max(20, ceiling(B * 0.5))] <- NA_real_
+```
+
+# Performance summary
+
+```{r performance-summary}
+f3 <- function(x) sprintf("%.3f", x)
+
+performance_summary <- data.frame(
+  Metric = c(
+    "Patients / events",
+    "Apparent AUC (95% CI, DeLong)",
+    "Optimism-corrected AUC (95% CI, location-shifted bootstrap)",
+    "AUC optimism",
+    "Calibration intercept, apparent / corrected",
+    "Calibration slope, apparent / corrected",
+    "Youden threshold",
+    "Sensitivity / specificity at Youden threshold",
+    "PPV / NPV at Youden threshold",
+    "Valid bootstrap resamples"
+  ),
+  Value = c(
+    sprintf("%d / %d", length(actual), sum(actual == 1)),
+    sprintf("%s (%s-%s)", f3(auc_apparent), f3(auc_ci_delong[1]), f3(auc_ci_delong[3])),
+    sprintf("%s (%s-%s)", f3(auc_corrected), f3(auc_corrected_ci[1]), f3(auc_corrected_ci[2])),
+    f3(mean_optimism),
+    sprintf("%s / %s", f3(cal_intercept_apparent), f3(cal_intercept_corrected)),
+    sprintf("%s / %s", f3(cal_slope_apparent), f3(cal_slope_corrected)),
+    f3(best_coords$threshold),
+    sprintf("%s / %s", f3(best_coords$sensitivity), f3(best_coords$specificity)),
+    sprintf("%s / %s", f3(best_coords$ppv), f3(best_coords$npv)),
+    sprintf("%d / %d", length(auc_boot_ok), B)
+  )
+)
+write.csv(performance_summary, file.path(OUTPUT_DIR, "performance_summary.csv"), row.names = FALSE)
+
+performance_summary %>%
+  kable(caption = "Final model performance") %>%
+  kable_styling(full_width = FALSE, position = "left")
+
+data.frame(
+  Model = c("Full model (all candidate variables)", "Final model (retained variables)"),
+  Apparent_AUC  = f3(c(auc_apparent_full, auc_apparent)),
+  Corrected_AUC = f3(c(auc_corrected_full, auc_corrected))
+) %>%
+  kable(caption = "Full versus final model") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+# Figures
+
+```{r figure-settings}
+fig_prefix <- file.path(OUTPUT_DIR, sprintf("%s_%d",
+  if (PRIMARY_COHORT) "NodeNegative" else "AllPatients", length(actual)))
+
+# Display labels for the nomogram (model terms are not changed)
+DISPLAY <- list(
+  histology_group = list(label = "Histologic subtype",
+                         levels = c("EMG1", "EMG2", "EMG3", "Other high-grade")),
+  molecular_subtype = list(label = "Molecular subtype",
+                           levels = c("p53abn", "NSMP", "MSI-H", "POLEmut")),
+  deep_myometrial_invasion  = list(label = "Deep myometrial invasion",
+                                   levels = c("Absent", "Present")),
+  cervical_stromal_invasion = list(label = "Cervical stromal invasion",
+                                   levels = c("Absent", "Present")),
+  extrauterine_extension    = list(label = "Extrauterine extension",
+                                   levels = c("Absent", "Present")),
+  radiologic_ln_enlargement = list(label = "Radiological LN enlargement",
+                                   levels = c("Absent", "Present")),
+  age   = list(label = "Age (years)"),
+  bmi   = list(label = "BMI (kg/m²)"),
+  ca125 = list(label = "CA-125 (U/mL)")
+)
+NOMOGRAM_TICKS <- list(bmi = c(20, 25, 30, 35, 40), ca125 = seq(0, 500, 100))
+CA125_DISPLAY_MAX <- 500   # display only; the model uses CA-125 as a continuous variable
+```
+
+```{r nomogram, fig.width=7.5, fig.height=5.2}
+dat_pub <- dat_for_nomo
+for (v in intersect(names(DISPLAY), nomo_vars)) {
+  if (!is.null(DISPLAY[[v]]$levels)) {
+    stopifnot(nlevels(dat_pub[[v]]) == length(DISPLAY[[v]]$levels))
+    levels(dat_pub[[v]]) <- DISPLAY[[v]]$levels   # order unchanged
+  }
+  Hmisc::label(dat_pub[[v]]) <- DISPLAY[[v]]$label
+}
+
+dd_pub <- rms::datadist(dat_pub)
+options(datadist = "dd_pub")
+
+fit_pub0 <- rms::lrm(as.formula(paste(outcome_var, "~", paste(nomo_vars, collapse = " + "))),
+                     data = dat_pub, x = TRUE, y = TRUE)
+stopifnot(length(coef(fit_pub0)) == length(coef(fit_nomo)))
+fit_pub <- fit_pub0
+fit_pub$coefficients <- setNames(unname(coef(fit_nomo)), names(coef(fit_pub0)))
+
+# Relabelling must not change predictions
+stopifnot(isTRUE(all.equal(
+  as.numeric(predict(fit_nomo, newdata = dat_for_nomo, type = "lp")),
+  as.numeric(predict(fit_pub,  newdata = dat_pub,      type = "lp")),
+  tolerance = 1e-8)))
+
+# Range of the linear predictor over the displayed predictor ranges
+display_ranges <- lapply(nomo_vars, function(v) {
+  if (is.factor(dat_pub[[v]])) levels(dat_pub[[v]])
+  else if (v == "ca125") c(0, CA125_DISPLAY_MAX)
+  else range(dat_pub[[v]], na.rm = TRUE)
+})
+names(display_ranges) <- nomo_vars
+extreme_grid <- do.call(expand.grid, c(display_ranges, stringsAsFactors = FALSE))
+for (v in nomo_vars) if (is.factor(dat_pub[[v]])) {
+  extreme_grid[[v]] <- factor(extreme_grid[[v]], levels = levels(dat_pub[[v]]))
+}
+lp_extreme <- as.numeric(predict(fit_pub, newdata = extreme_grid, type = "lp"))
+lp_min <- min(lp_extreme); lp_max <- max(lp_extreme)
+
+probability_ticks <- c(.05, .08, .10, .15, .20, .25, .30, .35, .40, .45)
+probability_ticks <- probability_ticks[probability_ticks >= plogis(lp_min) - 1e-10 &
+                                       probability_ticks <= min(.45, plogis(lp_max)) + 1e-10]
+
+nom_pub <- do.call(rms::nomogram, c(
+  list(fit_pub, lp = FALSE, lp.at = seq(lp_min, lp_max, length.out = 201),
+       fun = plogis, fun.at = probability_ticks, funlabel = "LNM probability",
+       maxscale = 100),
+  NOMOGRAM_TICKS[intersect(names(NOMOGRAM_TICKS), nomo_vars)]
+))
+
+# Total-points axis limited to attainable values
+ni <- attr(nom_pub, "info")
+tp_min <- (lp_min - ni$Intercept) * ni$sc
+tp_max <- (lp_max - ni$Intercept) * ni$sc
+tp_ticks <- pretty(c(max(0, tp_min), tp_max), n = 8)
+tp_ticks <- tp_ticks[tp_ticks >= max(0, tp_min) - 1e-8 & tp_ticks <= tp_max + 1e-8]
+if (tp_min <= 1e-8) tp_ticks <- sort(unique(c(0, tp_ticks)))
+if (length(tp_ticks)) nom_pub[["total.points"]]$x <- tp_ticks
+
+render_nomogram <- function() {
+  par(mar = c(1.2, 1, 1, 1), family = "sans", mgp = c(2, .6, 0), las = 1)
+  plot(nom_pub, xfrac = .30, cex.axis = .68, cex.var = .88, lmgp = .25)
+}
+ragg::agg_tiff(paste0(fig_prefix, "_Nomogram.tiff"), width = 7.5, height = 5.2,
+               units = "in", res = FIG_DPI, compression = "lzw", background = "white")
+render_nomogram(); invisible(dev.off())
+grDevices::cairo_pdf(paste0(fig_prefix, "_Nomogram.pdf"), width = 7.5,
+                     height = 5.2, family = "sans", bg = "white")
+render_nomogram(); invisible(dev.off())
+render_nomogram()
+
+options(datadist = old_datadist)
+```
+
+```{r roc-calibration, fig.width=12, fig.height=6}
+pub_theme <- ggplot2::theme_classic(base_size = 12) +
+  ggplot2::theme(plot.title  = ggplot2::element_text(face = "bold", size = 13),
+                 axis.title  = ggplot2::element_text(size = 11),
+                 axis.text   = ggplot2::element_text(size = 10),
+                 legend.text = ggplot2::element_text(size = 9),
+                 plot.margin = ggplot2::margin(8, 10, 8, 8))
+
+# (A) ROC curve
+roc_df <- data.frame(fpr = 1 - rev(roc_obj$specificities),
+                     sensitivity = rev(roc_obj$sensitivities))
+
+p_roc <- ggplot2::ggplot(roc_df, ggplot2::aes(x = fpr, y = sensitivity)) +
+  ggplot2::geom_line(linewidth = 0.95) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 0.55) +
+  ggplot2::annotate("text", x = 0.97, y = 0.06, hjust = 1, vjust = 0, size = 3.7, lineheight = 1.1,
+    label = sprintf("Apparent AUC = %.3f (95%% CI %.3f–%.3f)\nCorrected AUC = %.3f (95%% CI %.3f–%.3f)",
+                    auc_apparent, auc_ci_delong[1], auc_ci_delong[3],
+                    auc_corrected, auc_corrected_ci[1], auc_corrected_ci[2])) +
+  ggplot2::scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, .25), expand = c(0, 0)) +
+  ggplot2::scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, .25), expand = c(0, 0)) +
+  ggplot2::coord_fixed() +
+  ggplot2::labs(title = "A", x = "1 − Specificity", y = "Sensitivity") +
+  pub_theme
+
+# (B) Calibration plot
+cal_df <- rbind(
+  data.frame(predicted = cal_grid, observed = cal_curve_apparent,  curve = "Apparent"),
+  data.frame(predicted = cal_grid, observed = cal_curve_corrected, curve = "Bootstrap-corrected")
+)
+cal_df$curve <- factor(cal_df$curve, levels = c("Apparent", "Bootstrap-corrected"))
+
+p_cal <- ggplot2::ggplot(cal_df, ggplot2::aes(x = predicted, y = observed, linetype = curve)) +
+  ggplot2::geom_abline(intercept = 0, slope = 1, linetype = "dotted", linewidth = 0.55) +
+  ggplot2::geom_line(linewidth = 0.95, na.rm = TRUE) +
+  ggplot2::geom_rug(data = data.frame(predicted = cal_pred), ggplot2::aes(x = predicted),
+                    inherit.aes = FALSE, sides = "b", alpha = 0.16, linewidth = 0.22) +
+  ggplot2::annotate("text", x = cal_xmax * 0.97, y = cal_xmax * 0.08, hjust = 1, vjust = 0,
+    size = 3.7, lineheight = 1.2,
+    label = sprintf("Corrected intercept = %.2f\nCorrected slope = %.2f",
+                    cal_intercept_corrected, cal_slope_corrected)) +
+  ggplot2::scale_x_continuous(limits = c(0, cal_xmax), expand = c(0, 0)) +
+  ggplot2::scale_y_continuous(limits = c(0, cal_xmax), expand = c(0, 0)) +
+  ggplot2::coord_fixed() +
+  ggplot2::scale_linetype_manual(values = c("Apparent" = "dashed", "Bootstrap-corrected" = "solid")) +
+  ggplot2::labs(title = "B", x = "Predicted probability", y = "Observed probability", linetype = NULL) +
+  pub_theme +
+  ggplot2::theme(legend.position = c(0.34, 0.90),
+                 legend.background = ggplot2::element_rect(fill = "white", colour = NA))
+
+combined <- p_roc + p_cal + patchwork::plot_layout(ncol = 2)
+print(combined)
+
+ggplot2::ggsave(paste0(fig_prefix, "_ROC_Calibration.tiff"), combined, width = 260, height = 130,
+                units = "mm", dpi = FIG_DPI, compression = "lzw", bg = "white")
+ggplot2::ggsave(paste0(fig_prefix, "_ROC_Calibration.pdf"), combined, width = 260, height = 130,
+                units = "mm", device = grDevices::cairo_pdf)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
