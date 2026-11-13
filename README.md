@@ -1,1 +1,1 @@
-# Sumino-et-al.
+# Sumino et al.
